@@ -1,0 +1,3 @@
+# Cloudformation Stack Template file for deploying a new serverless bot
+# Resources include: API Gateway, Lambda, IAM
+# Currently, new servers are added manually depending upon region, and will have to be added to the role's IAM policy appropriately.
