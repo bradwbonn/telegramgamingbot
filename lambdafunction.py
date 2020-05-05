@@ -1,17 +1,17 @@
-import json, boto3, base64, urllib3
+import json, boto3, base64
 from botocore.exceptions import ClientError
 from os import getenv
+from urllib3 import PoolManager
 
-http200 = { 'statusCode': 200 }
+# init variables
 custom_filter = [{'Name':'tag:gaming'}]
-
-# Initialize environment variables containing implementation-specific fields
+http200 = { 'statusCode': 200 }
+# Initialize environment variables
 masteradmin = getenv('masteradmin')
 userdbname = getenv('userdbname')
 secretsmanagerregion = getenv('secretsmanagerregion')
 bottokenname = getenv('bottokenname')
 serverdbname = getenv('serverdbname')
-
 # Available commands and their associated help text
 command_prefixes = {
         "/help": 'For help about a specific command, type /help [command]',
@@ -19,6 +19,7 @@ command_prefixes = {
         "/startserver": "Admins-only. Start a server up. Bear in mind, there may be several minutes before the server is fully ready for play, even after it shows as running.\n/startserver <servername>",
         "/stopserver": "Admins-only. Cleanly shut down a gaming server by name. \n/stopserver <servername>",
         "/user": 'Show information about your privileges on the bot.',
+        "/showusers": 'List all users that the bot has currently authenticated',
         "/adduser": "Admins-only. Use it add a new Telegram user to the bot, or to change their privileges.\n/adduser <username> [admin|user]",
         "/deleteuser": "Admins-only. Use it to delete a Telgram username from the bot.\n/deleteuser <username>",
         "/maintenance": "{} only. Place the bot in maintenance mode so no other commands are avaialble.".format(masteradmin),
@@ -140,11 +141,14 @@ def send_message(text, chat_id):
     TELE_TOKEN=secretvalue
     URL = "https://api.telegram.org/bot{}/".format(TELE_TOKEN)
     url = URL + "sendMessage?text={}&parse_mode=Markdown&chat_id={}".format(text, chat_id)
-    myhttp = urllib3.PoolManager()
+    myhttp = PoolManager()
     try:
         r = myhttp.request('GET', url)
     except ClientError as e:
+        print("Couldn't send message to Telegram: {}".format(e))
         raise e
+    if r.status != 200:
+        print("Telegram response: {} {}\n{}".format(r.status,r.headers,r.data))
 
 # Determine if the bot is in maintenance mode or not by reading the token from the DB
 def check_maint():
@@ -174,7 +178,7 @@ def toggle_maint(setting):
 
 # Get list of servers from DynamoDB Table and send a combined message to the chat
 def get_gaming_servers(chat_id):
-    serverlist = ["Server list:"]
+    serverlist = ["Server list:\n*Name:* _Game_ \\[instance ID] - region"]
     dynamodb = boto3.resource('dynamodb')
     table = dynamodb.Table(serverdbname)
     try:
@@ -182,7 +186,7 @@ def get_gaming_servers(chat_id):
     except:
         return False
     for i in response['Items']:
-        serverlist.append("*{}* \\[{}] - {}".format(i['servername'],i['instanceid'],i['region']))
+        serverlist.append("*{}:* _{}_ \\[{}] - {}".format(i['servername'],i['game'],i['instanceid'],i['region']))
     send_message("\n".join(serverlist),chat_id)
     return True
     
@@ -200,14 +204,21 @@ def get_server(servername):
             )
     except:
         return server
-    
-    server['instanceid'] = response['Item']['instanceid']['S']
-    server['region'] = response['Item']['region']['S']
+    try:
+        server['instanceid'] = response['Item']['instanceid']['S']
+        server['region'] = response['Item']['region']['S']
+        server['notes'] = response['Item']['notes']['S']
+        server['game'] = response['Item']['game']['S']
+    except:
+        print("Couldn't get instance data from DynamoDB record for: {}".format(servername))
+        return server
     return server
 
 def server_status(servername, chat_id):
+    # print("Checking status of:{}".format(servername))
     server = get_server(servername)
     if server['region'] == 'unknown':
+        print("Couldn't get server details for: {}".format(servername))
         return False
     session = boto3.Session(region_name=server['region'])
     client = session.client('ec2')
@@ -216,18 +227,21 @@ def server_status(servername, chat_id):
         response = client.describe_instances(InstanceIds=[server['instanceid']])
         ec2instance = ec2.Instance(server['instanceid'])
     except Exception as e:
+        print ("Couldn't describe instance: {}".format(e))
         return False
     try:
         ip_address = response['Reservations'][0]['Instances'][0]['PublicIpAddress']
     except:
         ip_address = "none"
-    send_message("*{}* \\[_{}_] IP: {}".format(
+    message = "*{}* ({}) \\[_{}_] IP: {}\n{}\n{}".format(
         servername,
+        response['Reservations'][0]['Instances'][0]['InstanceType'],
         response['Reservations'][0]['Instances'][0]['State']['Name'],
-        ip_address
-        ),
-        chat_id
+        ip_address,
+        server['game'],
+        server['notes']
     )
+    send_message(message,chat_id)
     return True
     
 def start_server(servername, chat_id):
@@ -257,33 +271,27 @@ def stop_server(servername, chat_id):
     except:
         return False
     return True
-    
 
-# # Get the list of server IDs matching the tag "gaming:server" and send a combined message to the chat
-# def get_gaming_servers(chat_id):
-#     client = boto3.client('ec2')
-#     custom_filter = [{
-#         'Name':'tag:gaming', 
-#         'Values': ['server']}]
-#     instance_data = ["Server list:"]
-#     try:
-#         response = client.describe_instances(Filters=custom_filter)
-#     except:
-#         return False
-#     for instance in response['Reservations'][0]['Instances']:
-#         instancename = ''
-#         for tags in instance['Tags']:
-#                 if tags["Key"] == 'Name':
-#                     instancename = tags["Value"]
-#         instance_data.append("*{}* ({}) - {} \\[_{}_]".format(
-#                 instancename,
-#                 instance['Placement']['AvailabilityZone'],
-#                 instance['InstanceType'],
-#                 instance['State']['Name']
-#             )
-#         )
-#     send_message("\n".join(instance_data),chat_id)
-#     return True
+# List all users in the database
+def list_users(chat_id):
+    userlist = ["*Bot users:*"]
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table(userdbname)
+    try:
+        response = table.scan()
+    except:
+        return False
+    for i in response['Items']:
+        if i['username'] == "MaintenanceModeToken":
+            continue
+        if i['username'] == masteradmin:
+            adminstatus = "Master Admin"
+        elif i['admin']:
+            adminstatus = "Admin"
+        else:
+            adminstatus = "User"
+        userlist.append("*{}* - {}".format(i['username'],adminstatus))
+    send_message("\n".join(userlist),chat_id)
 
 # Primary function handling code
 def lambda_handler(event, context):
@@ -300,6 +308,7 @@ def lambda_handler(event, context):
     try:
         chat_id = message['message']['chat']['id']
         user = message['message']['from']['username']
+        print("message: {} from: {} [{}]".format(command,user,chat_id))
     except Exception as e:
         print("No message data to use")
         raise e
@@ -337,11 +346,9 @@ def lambda_handler(event, context):
         send_message("Sorry, I am presently in maintenance mode. Back with you shortly. Bug {} if this continues.".format(masteradmin),chat_id)
         return http200
     
-    # hard-coded instance IDs:
-    instance_ids = ['i-05e0de96ae267eb7f']
     
     # Process various operational commands below
-    
+    #
     # Show the server status
     if (command[:11] == "/showstatus"):
         commands = command.split(" ")
@@ -357,34 +364,27 @@ def lambda_handler(event, context):
     elif (command[:12] == "/startserver") and (user_status == "admin"):
         commands = command.split(" ")
         if len(commands) < 2:
-            send_message("/startserver <servername>",chat_id)
+            send_message("/startserver <servername> (names are case-sensitive)",chat_id)
             return http200
         if start_server(commands[1],chat_id):
             send_message("{} is booting up {}".format(user,commands[1]),chat_id)
             print("INFO: {} started the server".format(user))
         else:
-            send_message("Couldn't boot up server '{}'".format(commands[1]),chat_id)
+            send_message("Couldn't boot up server '{}' Remember they are case-sensitive.".format(commands[1]),chat_id)
             print("ERROR: Couldn't start server '{}'".format(commands[1]),chat_id)
         
     # Shut down the server
     elif (command[:11] == "/stopserver") and (user_status == "admin"):
         commands = command.split(" ")
         if len(commands) < 2:
-            send_message("/stopserver <servername>",chat_id)
+            send_message("/stopserver <servername> (server names are case-sensitive)",chat_id)
             return http200
         if stop_server(commands[1],chat_id):
             send_message("NOTICE: {} is shutting down {}".format(user,commands[1]),chat_id)
             print("INFO: {} shut down the server".format(user))
         else:
-            send_message("Couldn't shut down server '{}'".format(commands[1]),chat_id)
+            send_message("Couldn't shut down server '{}' Remember they are case-sensitive.".format(commands[1]),chat_id)
             print("ERROR: Couldn't shut down server '{}'".format(commands[1]),chat_id)
-        # # Connect to EC2
-        # client = boto3.client('ec2')
-        # send_message("{} is shutting the server down".format(user),chat_id)
-        # print("INFO: {} shut the server down".format(user))
-        # response = client.stop_instances(
-        #     InstanceIds=instance_ids
-        # )
         
     # Print the help pages
     elif (command[:5] == "/help"):
@@ -418,7 +418,7 @@ def lambda_handler(event, context):
         else:
             complete_help = "\n\n".join([
                 "I'm a helper bot that can manage the EBC gaming server(s) for you. These gaming servers are running in {}'s personal AWS account, so please be kind and shut the server(s) you're using down when you're finished with them.  Have fun!".format(masteradmin),
-
+                "NOTE: Right now, server names are case-sensitive when interacting with them.  You can also type /help <command> for more information about a specific command.",
                 "Commands:\n{}".format(
                     '\n'.join("{!s}".format(key) for key in command_prefixes.keys())
                 )
@@ -429,7 +429,7 @@ def lambda_handler(event, context):
             )
         
     # Show the privileges of the user messaging the bot
-    elif (command == "/user"):
+    elif (command[:5] == "/user"):
         if (user == masteradmin):
             send_message(
                 "Hi {}! You're the Master Administrator!".format(user),
@@ -442,10 +442,10 @@ def lambda_handler(event, context):
             )
         
     # Do something silly...
-    elif (command == "/fensler"):
+    elif (command[:8] == "/fensler"):
         send_message("Hey kid...\nI'm a computer...\nStop all the downloadin'...",chat_id)
-    elif (command == "/unicorn"):
-        send_message("Do not ask about the unicorns. They get enough attention as it is...the egotistical pointy equines...",chat_id)
+    elif (command[:8] == "/unicorn"):
+        send_message("Do not ask about the unicorns. They get enough attention as it is...the egotistical pointy equines...\nThey unionized now, can you believe it?",chat_id)
         
     # Handle adding/updating a user of the bot    
     elif (command[:8] == "/adduser") and (user_status == "admin"):
@@ -480,9 +480,9 @@ def lambda_handler(event, context):
     elif (command[:11] == "/dropserver") and (user_status == "admin"):
         send_message("Not implemented yet",chat_id)
         
-    # For future...
+    # List all users authenticated on the bot
     elif (command[:10]== "/showusers") and (user_status != "unknown"):
-        send_message("Not implemented yet",chat_id)
+        list_users(chat_id)
     
     # Show all servers controlled by this bot
     elif (command[:12] == "/showservers") and (user_status != "unknown"):
@@ -495,3 +495,4 @@ def lambda_handler(event, context):
 
     # Command handling logic ends here
     return http200
+
