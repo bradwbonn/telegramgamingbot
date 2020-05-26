@@ -327,7 +327,7 @@ def lambda_handler(event, context):
     maint = check_maint()
         
     # Handle toggling maintenance mode
-    if (command == "/maintenance") and (user == masteradmin):
+    if (command[:12] == "/maintenance") and (user == masteradmin):
         if maint == False:
             send_message("Enabling maintenance mode...",chat_id)
             print("INFO: {} is putting the bot in maintenance mode".format(user))
@@ -337,7 +337,7 @@ def lambda_handler(event, context):
             print("INFO: {} is taking the bot out of maintenance mode".format(user))
             toggle_maint(False)
         return http200
-    elif (command == "/maintenance"):
+    elif (command[:12] == "/maintenance"):
         send_message("Only {} is allowed to control me on this level.".format(masteradmin),chat_id)
         return http200
     
